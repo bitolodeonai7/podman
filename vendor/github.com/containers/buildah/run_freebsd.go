@@ -1,5 +1,4 @@
 //go:build freebsd
-// +build freebsd
 
 package buildah
 
@@ -46,16 +45,14 @@ const (
 	PROC_REAP_RELEASE = 3
 )
 
-var (
-	// We dont want to remove destinations with /etc, /dev as
-	// rootfs already contains these files and unionfs will create
-	// a `whiteout` i.e `.wh` files on removal of overlapping
-	// files from these directories.  everything other than these
-	// will be cleaned up
-	nonCleanablePrefixes = []string{
-		"/etc", "/dev",
-	}
-)
+// We dont want to remove destinations with /etc, /dev as
+// rootfs already contains these files and unionfs will create
+// a `whiteout` i.e `.wh` files on removal of overlapping
+// files from these directories.  everything other than these
+// will be cleaned up
+var nonCleanablePrefixes = []string{
+	"/etc", "/dev",
+}
 
 func procctl(idtype int, id int, cmd int, arg *byte) error {
 	_, _, e1 := unix.Syscall6(
@@ -127,10 +124,16 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 		return err
 	}
 
+	workDir := b.WorkDir()
 	if options.WorkingDir != "" {
 		g.SetProcessCwd(options.WorkingDir)
+		workDir = options.WorkingDir
 	} else if b.WorkDir() != "" {
 		g.SetProcessCwd(b.WorkDir())
+		workDir = b.WorkDir()
+	}
+	if workDir == "" {
+		workDir = string(os.PathSeparator)
 	}
 	mountPoint, err := b.Mount(b.MountLabel)
 	if err != nil {
@@ -185,7 +188,7 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 	uid, gid := spec.Process.User.UID, spec.Process.User.GID
 	idPair := &idtools.IDPair{UID: int(uid), GID: int(gid)}
 
-	mode := os.FileMode(0755)
+	mode := os.FileMode(0o755)
 	coptions := copier.MkdirOptions{
 		ChownNew: idPair,
 		ChmodNew: &mode,
@@ -226,7 +229,7 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 					})
 				}
 			}
-			err = b.addHostsEntries(hostsFile, mountPoint, entries, nil)
+			err = b.addHostsEntries(hostsFile, mountPoint, entries, nil, "")
 			if err != nil {
 				return err
 			}
@@ -244,7 +247,7 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 		// Only add entries here if we do not have to do setup network,
 		// if we do we have to do it much later after the network setup.
 		if !configureNetwork {
-			err = b.addResolvConfEntries(resolvFile, nil, nil, false, true)
+			err = b.addResolvConfEntries(resolvFile, nil, spec, false, true)
 			if err != nil {
 				return err
 			}
@@ -252,6 +255,7 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 	}
 
 	runMountInfo := runMountInfo{
+		WorkDir:          workDir,
 		ContextDir:       options.ContextDir,
 		Secrets:          options.Secrets,
 		SSHSources:       options.SSHSources,
@@ -276,7 +280,7 @@ func (b *Builder) Run(command []string, options RunOptions) error {
 	}
 
 	defer func() {
-		if err := b.cleanupRunMounts(options.SystemContext, mountPoint, runArtifacts); err != nil {
+		if err := b.cleanupRunMounts(mountPoint, runArtifacts); err != nil {
 			options.Logger.Errorf("unable to cleanup run mounts %v", err)
 		}
 	}()
@@ -351,9 +355,12 @@ func setupSpecialMountSpecChanges(spec *spec.Spec, shmSize string) ([]specs.Moun
 	return spec.Mounts, nil
 }
 
-// If this function succeeds and returns a non-nil *lockfile.LockFile, the caller must unlock it (when??).
-func (b *Builder) getCacheMount(tokens []string, stageMountPoints map[string]internal.StageMountDetails, idMaps IDMaps, workDir string) (*spec.Mount, *lockfile.LockFile, error) {
-	return nil, nil, errors.New("cache mounts not supported on freebsd")
+// If this succeeded, the caller would be expected to, after the command which
+// uses the mount exits, unmount the mounted filesystem and remove its
+// mountpoint (if we provided the path to its mountpoint), and release the lock
+// (if we took one).
+func (b *Builder) getCacheMount(tokens []string, stageMountPoints map[string]internal.StageMountDetails, idMaps IDMaps, workDir, tmpDir string) (*specs.Mount, string, *lockfile.LockFile, error) {
+	return nil, "", nil, errors.New("cache mounts not supported on freebsd")
 }
 
 func (b *Builder) runSetupVolumeMounts(mountLabel string, volumeMounts []string, optionMounts []specs.Mount, idMaps IDMaps) (mounts []specs.Mount, Err error) {
@@ -536,7 +543,7 @@ func (b *Builder) configureNamespaces(g *generate.Generator, options *RunOptions
 	namespaceOptions.AddOrReplace(options.NamespaceOptions...)
 
 	networkPolicy := options.ConfigureNetwork
-	//Nothing was specified explicitly so network policy should be inherited from builder
+	// Nothing was specified explicitly so network policy should be inherited from builder
 	if networkPolicy == NetworkDefault {
 		networkPolicy = b.ConfigureNetwork
 

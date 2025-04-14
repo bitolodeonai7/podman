@@ -1,5 +1,4 @@
 //go:build linux && cgo
-// +build linux,cgo
 
 package overlay
 
@@ -13,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/containers/storage/pkg/chunked/dump"
 	"github.com/containers/storage/pkg/fsverity"
@@ -25,6 +25,10 @@ var (
 	composeFsHelperOnce sync.Once
 	composeFsHelperPath string
 	composeFsHelperErr  error
+
+	// skipMountViaFile is used to avoid trying to mount EROFS directly via the file if we already know the current kernel
+	// does not support it.  Mounting directly via a file will be supported in kernel 6.12.
+	skipMountViaFile atomic.Bool
 )
 
 func getComposeFsHelper() (string, error) {
@@ -137,59 +141,85 @@ func hasACL(path string) (bool, error) {
 	return binary.LittleEndian.Uint32(flags)&LCFS_EROFS_FLAGS_HAS_ACL != 0, nil
 }
 
-func mountComposefsBlob(dataDir, mountPoint string) error {
-	blobFile := getComposefsBlob(dataDir)
-	loop, err := loopback.AttachLoopDeviceRO(blobFile)
-	if err != nil {
-		return err
-	}
-	defer loop.Close()
+func openBlobFile(blobFile string, hasACL, useLoopDevice bool) (int, error) {
+	if useLoopDevice {
+		loop, err := loopback.AttachLoopDeviceRO(blobFile)
+		if err != nil {
+			return -1, err
+		}
+		defer loop.Close()
 
-	hasACL, err := hasACL(blobFile)
-	if err != nil {
-		return err
+		blobFile = loop.Name()
 	}
 
 	fsfd, err := unix.Fsopen("erofs", 0)
 	if err != nil {
-		return fmt.Errorf("failed to open erofs filesystem: %w", err)
+		return -1, fmt.Errorf("failed to open erofs filesystem: %w", err)
 	}
 	defer unix.Close(fsfd)
 
-	if err := unix.FsconfigSetString(fsfd, "source", loop.Name()); err != nil {
-		return fmt.Errorf("failed to set source for erofs filesystem: %w", err)
+	if err := unix.FsconfigSetString(fsfd, "source", blobFile); err != nil {
+		return -1, fmt.Errorf("failed to set source for erofs filesystem: %w", err)
 	}
 
 	if err := unix.FsconfigSetFlag(fsfd, "ro"); err != nil {
-		return fmt.Errorf("failed to set erofs filesystem read-only: %w", err)
+		return -1, fmt.Errorf("failed to set erofs filesystem read-only: %w", err)
 	}
 
 	if !hasACL {
 		if err := unix.FsconfigSetFlag(fsfd, "noacl"); err != nil {
-			return fmt.Errorf("failed to set noacl for erofs filesystem: %w", err)
+			return -1, fmt.Errorf("failed to set noacl for erofs filesystem: %w", err)
 		}
 	}
 
 	if err := unix.FsconfigCreate(fsfd); err != nil {
 		buffer := make([]byte, 4096)
 		if n, _ := unix.Read(fsfd, buffer); n > 0 {
-			return fmt.Errorf("failed to create erofs filesystem: %s: %w", string(buffer[:n]), err)
+			return -1, fmt.Errorf("failed to create erofs filesystem: %s: %w", strings.TrimSuffix(string(buffer[:n]), "\n"), err)
 		}
-		return fmt.Errorf("failed to create erofs filesystem: %w", err)
+		return -1, fmt.Errorf("failed to create erofs filesystem: %w", err)
 	}
 
 	mfd, err := unix.Fsmount(fsfd, 0, unix.MOUNT_ATTR_RDONLY)
 	if err != nil {
 		buffer := make([]byte, 4096)
 		if n, _ := unix.Read(fsfd, buffer); n > 0 {
-			return fmt.Errorf("failed to mount erofs filesystem: %s: %w", string(buffer[:n]), err)
+			return -1, fmt.Errorf("failed to mount erofs filesystem: %s: %w", string(buffer[:n]), err)
 		}
-		return fmt.Errorf("failed to mount erofs filesystem: %w", err)
+		return -1, fmt.Errorf("failed to mount erofs filesystem: %w", err)
+	}
+	return mfd, nil
+}
+
+func openComposefsMount(dataDir string) (int, error) {
+	blobFile := getComposefsBlob(dataDir)
+
+	hasACL, err := hasACL(blobFile)
+	if err != nil {
+		return -1, err
+	}
+
+	if !skipMountViaFile.Load() {
+		fd, err := openBlobFile(blobFile, hasACL, false)
+		if err == nil || !errors.Is(err, unix.ENOTBLK) {
+			return fd, err
+		}
+		logrus.Debugf("The current kernel doesn't support mounting EROFS directly from a file, fallback to a loopback device")
+		skipMountViaFile.Store(true)
+	}
+
+	return openBlobFile(blobFile, hasACL, true)
+}
+
+func mountComposefsBlob(dataDir, mountPoint string) error {
+	mfd, err := openComposefsMount(dataDir)
+	if err != nil {
+		return err
 	}
 	defer unix.Close(mfd)
 
 	if err := unix.MoveMount(mfd, "", unix.AT_FDCWD, mountPoint, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
-		return fmt.Errorf("failed to move mount: %w", err)
+		return fmt.Errorf("failed to move mount to %q: %w", mountPoint, err)
 	}
 	return nil
 }
